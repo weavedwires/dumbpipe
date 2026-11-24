@@ -4,15 +4,15 @@ use std::{
     net::{IpAddr, SocketAddr, SocketAddrV4, SocketAddrV6, ToSocketAddrs},
     path::PathBuf,
     str::FromStr,
-    sync::LazyLock,
-    time::Duration,
+    sync::{atomic::AtomicU64, atomic::Ordering, Arc, LazyLock, OnceLock},
+    time::{Duration, Instant},
 };
 
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
 use dumbpipe::NodeTicket;
 #[cfg(unix)]
-use iroh::endpoint::Connection;
+use iroh::endpoint::Connection as IrohConnection;
 use iroh::{
     dns::DnsResolver,
     endpoint::{Incoming, RecvStream, SendStream},
@@ -28,6 +28,10 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 const ONLINE_TIMEOUT: Duration = Duration::from_secs(5);
+
+const COPY_BUF_SIZE: usize = 16 * 1024;
+const STOPPED_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_IDLE_TIMEOUT: u64 = 120;
 
 /// Name of the file, in the directory where the program is run, used to
 /// persist the secret key for reuse across invocations.
@@ -251,6 +255,9 @@ pub struct CommonArgs {
     /// The verbosity level. Repeat to increase verbosity.
     #[clap(short = 'v', long, action = clap::ArgAction::Count)]
     pub verbose: u8,
+
+    #[clap(long, default_value_t = DEFAULT_IDLE_TIMEOUT, value_name = "SECS")]
+    pub idle_timeout: u64,
 }
 
 impl CommonArgs {
@@ -263,6 +270,10 @@ impl CommonArgs {
 
     fn is_custom_alpn(&self) -> bool {
         self.custom_alpn.is_some()
+    }
+
+    fn idle_timeout(&self) -> Option<Duration> {
+        (self.idle_timeout > 0).then(|| Duration::from_secs(self.idle_timeout))
     }
 }
 
@@ -446,8 +457,9 @@ async fn forward_udp_stream(
     });
 
     // Wait for first task to finish or ctrl-c
+    let shutdown = shutdown_token();
     tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
+        _ = shutdown.cancelled() => {
             token.cancel();
         }
         res = t1 => res.context("stream->udp task")??,
@@ -456,53 +468,120 @@ async fn forward_udp_stream(
     Ok(())
 }
 
-/// Copy from a reader to a quinn stream.
-///
-/// Will send a reset to the other side if the operation is cancelled, and fail
-/// with an error.
-///
-/// Returns the number of bytes copied in case of success.
+struct IdleWatch {
+    start: Instant,
+    last: AtomicU64,
+}
+
+impl IdleWatch {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            last: AtomicU64::new(0),
+        }
+    }
+
+    fn touch(&self) {
+        self.last
+            .store(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    fn idle_for(&self) -> Duration {
+        let last = self.last.load(Ordering::Relaxed);
+        self.start
+            .elapsed()
+            .saturating_sub(Duration::from_millis(last))
+    }
+}
+
+async fn watch_idle(watch: Arc<IdleWatch>, idle: Duration, token: CancellationToken) {
+    let tick = (idle / 4).max(Duration::from_millis(10));
+    loop {
+        tokio::select! {
+            _ = token.cancelled() => return,
+            _ = tokio::time::sleep(tick) => {
+                if watch.idle_for() >= idle {
+                    tracing::info!("closing idle connection after {:?} of silence", idle);
+                    token.cancel();
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn copy_watched<R, W, F>(from: &mut R, to: &mut W, on_activity: &F) -> io::Result<u64>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    F: Fn(),
+{
+    let mut buf = vec![0u8; COPY_BUF_SIZE];
+    let mut copied = 0u64;
+    loop {
+        let read = from.read(&mut buf).await?;
+        if read == 0 {
+            return Ok(copied);
+        }
+        on_activity();
+        to.write_all(&buf[..read]).await?;
+        on_activity();
+        copied += read as u64;
+    }
+}
+
 async fn copy_to_noq(
     mut from: impl AsyncRead + Unpin,
     mut send: SendStream,
     token: CancellationToken,
+    on_activity: impl Fn() + Send + 'static,
 ) -> io::Result<u64> {
     tracing::trace!("copying to noq");
     tokio::select! {
-        res = tokio::io::copy(&mut from, &mut send) => {
+        res = copy_watched(&mut from, &mut send, &on_activity) => {
             let size = res?;
             send.finish()?;
             // Wait for the remote to acknowledge it has received all of the data.
             // Closing the endpoint too soon after `finish` may otherwise drop data still in flight.
-            send.stopped().await.map_err(io::Error::other)?;
+            timeout(STOPPED_TIMEOUT, send.stopped())
+                .await
+                .map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "peer did not acknowledge the end of the stream",
+                    )
+                })?
+                .map_err(io::Error::other)?;
             Ok(size)
         }
         _ = token.cancelled() => {
-            // send a reset to the other side immediately
             send.reset(0u8.into()).ok();
             Err(io::Error::other("cancelled"))
         }
     }
 }
 
-/// Copy from a noq stream to a writer.
-///
-/// Will send stop to the other side if the operation is cancelled, and fail
-/// with an error.
-///
-/// Returns the number of bytes copied in case of success.
 async fn copy_from_noq(
     mut recv: RecvStream,
     mut to: impl AsyncWrite + Unpin,
     token: CancellationToken,
+    on_activity: impl Fn() + Send + 'static,
 ) -> io::Result<u64> {
     tokio::select! {
-        res = tokio::io::copy(&mut recv, &mut to) => {
+        res = copy_watched(&mut recv, &mut to, &on_activity) => {
             Ok(res?)
         },
         _ = token.cancelled() => {
             recv.stop(0u8.into()).ok();
             Err(io::Error::other("cancelled"))
+        }
+    }
+}
+
+fn activity_hook(watch: Option<Arc<IdleWatch>>) -> impl Fn() + Send + 'static {
+    move || {
+        if let Some(watch) = &watch {
+            watch.touch();
         }
     }
 }
@@ -661,42 +740,158 @@ fn cancel_token<T>(token: CancellationToken) -> impl Fn(T) -> T {
     }
 }
 
-/// Bidirectionally forward data from a noq stream and an arbitrary tokio
-/// reader/writer pair, aborting both sides when either one forwarder is done,
-/// or when control-c is pressed.
-async fn forward_bidi(
-    from1: impl AsyncRead + Send + Sync + Unpin + 'static,
-    to1: impl AsyncWrite + Send + Sync + Unpin + 'static,
-    from2: RecvStream,
-    to2: SendStream,
-) -> Result<()> {
-    let token1 = CancellationToken::new();
-    let token2 = token1.clone();
-    let token3 = token1.clone();
-    let forward_from_stdin = tokio::spawn(async move {
-        copy_to_noq(from1, to2, token1.clone())
-            .await
-            .map_err(cancel_token(token1))
-    });
-    let forward_to_stdout = tokio::spawn(async move {
-        copy_from_noq(from2, to1, token2.clone())
-            .await
-            .map_err(cancel_token(token2))
-    });
-    let _control_c = tokio::spawn(async move {
-        tokio::signal::ctrl_c().await?;
-        token3.cancel();
-        io::Result::Ok(())
-    });
-    forward_to_stdout
-        .await
-        .context("forward to stdout failed")?
-        .context("forward to stdout failed")?;
-    forward_from_stdin
-        .await
-        .context("forward from stdin failed")?
-        .context("forward from stdin failed")?;
-    Ok(())
+fn shutdown_token() -> CancellationToken {
+    static SHUTDOWN: OnceLock<CancellationToken> = OnceLock::new();
+    SHUTDOWN
+        .get_or_init(|| {
+            let token = CancellationToken::new();
+            let cancel = token.clone();
+            tokio::spawn(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    cancel.cancel();
+                }
+            });
+            token
+        })
+        .clone()
+}
+
+#[derive(Clone, Copy)]
+enum Direction {
+    ToEndpoint,
+    FromEndpoint,
+}
+
+impl Direction {
+    fn name(self) -> &'static str {
+        match self {
+            Self::ToEndpoint => "to endpoint",
+            Self::FromEndpoint => "from endpoint",
+        }
+    }
+}
+
+struct Connection<LR, LW> {
+    local_read: LR,
+    local_write: LW,
+    endpoint_recv: RecvStream,
+    endpoint_send: SendStream,
+    idle: Option<Duration>,
+    token: CancellationToken,
+    watch: Option<Arc<IdleWatch>>,
+}
+
+impl<LR, LW> Connection<LR, LW>
+where
+    LR: AsyncRead + Send + Sync + Unpin + 'static,
+    LW: AsyncWrite + Send + Sync + Unpin + 'static,
+{
+    fn new(
+        local_read: LR,
+        local_write: LW,
+        endpoint_recv: RecvStream,
+        endpoint_send: SendStream,
+        idle: Option<Duration>,
+    ) -> Self {
+        Self {
+            local_read,
+            local_write,
+            endpoint_recv,
+            endpoint_send,
+            idle,
+            token: CancellationToken::new(),
+            watch: idle.map(|_| Arc::new(IdleWatch::new())),
+        }
+    }
+
+    async fn forward(self) -> Result<()> {
+        let Self {
+            local_read,
+            local_write,
+            endpoint_recv,
+            endpoint_send,
+            idle,
+            token,
+            watch,
+        } = self;
+        let mut to_endpoint = tokio::spawn({
+            let (token, watch) = (token.clone(), watch.clone());
+            async move {
+                copy_to_noq(
+                    local_read,
+                    endpoint_send,
+                    token.clone(),
+                    activity_hook(watch),
+                )
+                .await
+                .map_err(cancel_token(token))
+            }
+        });
+        let mut from_endpoint = tokio::spawn({
+            let (token, watch) = (token.clone(), watch.clone());
+            async move {
+                copy_from_noq(
+                    endpoint_recv,
+                    local_write,
+                    token.clone(),
+                    activity_hook(watch),
+                )
+                .await
+                .map_err(cancel_token(token))
+            }
+        });
+        let mut watchdog = match (idle, watch) {
+            (Some(idle), Some(watch)) => Some(tokio::spawn(watch_idle(watch, idle, token.clone()))),
+            _ => None,
+        };
+        let shutdown = shutdown_token();
+        let finished = tokio::select! {
+            res = &mut to_endpoint => Some((Direction::ToEndpoint, res)),
+            res = &mut from_endpoint => Some((Direction::FromEndpoint, res)),
+            _ = shutdown.cancelled() => None,
+        };
+        let result = match finished {
+            None => Ok(()),
+            Some((direction, res)) => match res {
+                Err(cause) => {
+                    Err(cause).with_context(|| format!("forward {} task failed", direction.name()))
+                }
+                Ok(Err(cause)) => {
+                    Err(cause).with_context(|| format!("forward {} failed", direction.name()))
+                }
+                Ok(Ok(copied)) => {
+                    tracing::debug!("forward {} finished after {copied} bytes", direction.name());
+                    let (handle, other) = match direction {
+                        Direction::ToEndpoint => (&mut from_endpoint, Direction::FromEndpoint),
+                        Direction::FromEndpoint => (&mut to_endpoint, Direction::ToEndpoint),
+                    };
+                    tokio::select! {
+                        res = handle => match res {
+                            Ok(Ok(copied)) => {
+                                tracing::debug!(
+                                    "forward {} finished after {copied} bytes",
+                                    other.name()
+                                );
+                                Ok(())
+                            }
+                            Ok(Err(cause)) => Err(cause)
+                                .with_context(|| format!("forward {} failed", other.name())),
+                            Err(cause) => Err(cause)
+                                .with_context(|| format!("forward {} task failed", other.name())),
+                        },
+                        _ = shutdown.cancelled() => Ok(()),
+                    }
+                }
+            },
+        };
+        token.cancel();
+        to_endpoint.abort();
+        from_endpoint.abort();
+        if let Some(watchdog) = watchdog.take() {
+            watchdog.abort();
+        }
+        result
+    }
 }
 
 /// Wait for the endpoint to figure out its home relay, with a timeout.
@@ -723,6 +918,7 @@ fn endpoint_addr(endpoint: &Endpoint, no_direct: bool) -> NodeAddr {
 }
 
 async fn listen_stdio(args: ListenArgs) -> Result<()> {
+    let idle = args.common.idle_timeout();
     let secret_key = get_or_create_secret()?;
     let endpoint = create_endpoint(secret_key, &args.common, vec![args.common.alpn()?]).await?;
     // wait for the endpoint to figure out its home relay and addresses before making a ticket
@@ -781,10 +977,14 @@ dumbpipe connect {short}"
                 "forwarding stdout to {} (ignoring stdin)",
                 remote_endpoint_id
             );
-            forward_bidi(tokio::io::empty(), tokio::io::stdout(), r, s).await?;
+            Connection::new(tokio::io::empty(), tokio::io::stdout(), r, s, idle)
+                .forward()
+                .await?;
         } else {
             tracing::info!("forwarding stdin/stdout to {}", remote_endpoint_id);
-            forward_bidi(tokio::io::stdin(), tokio::io::stdout(), r, s).await?;
+            Connection::new(tokio::io::stdin(), tokio::io::stdout(), r, s, idle)
+                .forward()
+                .await?;
         }
         // stop accepting connections after the first successful one
         break;
@@ -794,6 +994,7 @@ dumbpipe connect {short}"
 }
 
 async fn connect_stdio(args: ConnectArgs) -> Result<()> {
+    let idle = args.common.idle_timeout();
     let secret_key = get_or_create_secret()?;
     let endpoint = create_endpoint(secret_key, &args.common, vec![]).await?;
     let addr = dial_addr(&args.ticket, args.common.no_direct);
@@ -824,10 +1025,14 @@ async fn connect_stdio(args: ConnectArgs) -> Result<()> {
             "forwarding stdout to {} (ignoring stdin)",
             remote_endpoint_id
         );
-        forward_bidi(tokio::io::empty(), tokio::io::stdout(), r, s).await?;
+        Connection::new(tokio::io::empty(), tokio::io::stdout(), r, s, idle)
+            .forward()
+            .await?;
     } else {
         tracing::info!("forwarding stdin/stdout to {}", remote_endpoint_id);
-        forward_bidi(tokio::io::stdin(), tokio::io::stdout(), r, s).await?;
+        Connection::new(tokio::io::stdin(), tokio::io::stdout(), r, s, idle)
+            .forward()
+            .await?;
     }
     tokio::io::stdout()
         .flush()
@@ -875,6 +1080,7 @@ async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
         endpoint: Endpoint,
         handshake: bool,
         alpn: &[u8],
+        idle: Option<Duration>,
     ) -> Result<()> {
         let (tcp_stream, tcp_addr) = next.context("error accepting tcp connection")?;
         let (tcp_recv, tcp_send) = tcp_stream.into_split();
@@ -898,12 +1104,15 @@ async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
                 .await
                 .context("failed to write handshake")?;
         }
-        forward_bidi(tcp_recv, tcp_send, endpoint_recv, endpoint_send).await?;
+        Connection::new(tcp_recv, tcp_send, endpoint_recv, endpoint_send, idle)
+            .forward()
+            .await?;
         Ok(())
     }
     let addr = dial_addr(&args.ticket, args.common.no_direct);
     let handshake = !args.common.is_custom_alpn();
     let alpn = args.common.alpn()?;
+    let idle = args.common.idle_timeout();
     for listener in tcp_listeners {
         let endpoint = endpoint.clone();
         let addr = addr.clone();
@@ -916,7 +1125,7 @@ async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
                 let alpn = alpn.clone();
                 tokio::spawn(async move {
                     if let Err(cause) =
-                        handle_tcp_accept(next, addr, endpoint, handshake, &alpn).await
+                        handle_tcp_accept(next, addr, endpoint, handshake, &alpn, idle).await
                     {
                         // log error at warn level
                         //
@@ -929,7 +1138,7 @@ async fn connect_tcp(args: ConnectTcpArgs) -> Result<()> {
     }
 
     // wait for ctrl-c before shutting down
-    tokio::signal::ctrl_c().await?;
+    shutdown_token().cancelled().await;
     eprintln!("got ctrl-c, exiting");
     endpoint.close().await;
     Ok(())
@@ -976,6 +1185,7 @@ dumbpipe connect-tcp {short}"
         accepting: Incoming,
         addrs: Vec<std::net::SocketAddr>,
         handshake: bool,
+        idle: Option<Duration>,
     ) -> Result<()> {
         let connection = accepting.await.context("error accepting connection")?;
         let remote_endpoint_id = connection.remote_node_id().context("no peer certificate")?;
@@ -994,7 +1204,7 @@ dumbpipe connect-tcp {short}"
             tracing::info!("accepted bidi stream from {}", remote_endpoint_id);
             let addrs = addrs.clone();
             tokio::spawn(async move {
-                if let Err(cause) = handle_endpoint_stream(s, r, addrs, handshake).await {
+                if let Err(cause) = handle_endpoint_stream(s, r, addrs, handshake, idle).await {
                     tracing::warn!("error handling stream: {}", cause);
                 }
             });
@@ -1007,6 +1217,7 @@ dumbpipe connect-tcp {short}"
         mut r: RecvStream,
         addrs: Vec<std::net::SocketAddr>,
         handshake: bool,
+        idle: Option<Duration>,
     ) -> Result<()> {
         if handshake {
             // read the handshake and verify it
@@ -1020,14 +1231,15 @@ dumbpipe connect-tcp {short}"
             .await
             .with_context(|| format!("error connecting to {addrs:?}"))?;
         let (read, write) = connection.into_split();
-        forward_bidi(read, write, r, s).await?;
+        Connection::new(read, write, r, s, idle).forward().await?;
         Ok(())
     }
 
     loop {
+        let shutdown = shutdown_token();
         let incoming = select! {
             incoming = endpoint.accept() => incoming,
-            _ = tokio::signal::ctrl_c() => {
+            _ = shutdown.cancelled() => {
                 eprintln!("got ctrl-c, exiting");
                 break;
             }
@@ -1037,8 +1249,9 @@ dumbpipe connect-tcp {short}"
         };
         let addrs = addrs.clone();
         let handshake = !args.common.is_custom_alpn();
+        let idle = args.common.idle_timeout();
         tokio::spawn(async move {
-            if let Err(cause) = handle_endpoint_accept(incoming, addrs, handshake).await {
+            if let Err(cause) = handle_endpoint_accept(incoming, addrs, handshake, idle).await {
                 // log error at warn level
                 //
                 // we should know about it, but it's not fatal
@@ -1109,6 +1322,7 @@ async fn listen_unix(args: ListenUnixArgs) -> Result<()> {
         accepting: Incoming,
         socket_path: PathBuf,
         handshake: bool,
+        idle: Option<Duration>,
     ) -> Result<()> {
         tracing::trace!("accepting connection");
         let connection = accepting.await.context("error accepting connection")?;
@@ -1128,7 +1342,8 @@ async fn listen_unix(args: ListenUnixArgs) -> Result<()> {
             tracing::info!("accepted bidi stream from {}", remote_endpoint_id);
             let socket_path = socket_path.clone();
             tokio::spawn(async move {
-                if let Err(cause) = handle_endpoint_stream(s, r, socket_path, handshake).await {
+                if let Err(cause) = handle_endpoint_stream(s, r, socket_path, handshake, idle).await
+                {
                     tracing::warn!("error handling stream: {}", cause);
                 }
             });
@@ -1141,6 +1356,7 @@ async fn listen_unix(args: ListenUnixArgs) -> Result<()> {
         mut r: RecvStream,
         socket_path: PathBuf,
         handshake: bool,
+        idle: Option<Duration>,
     ) -> Result<()> {
         if handshake {
             // read the handshake and verify it
@@ -1159,15 +1375,16 @@ async fn listen_unix(args: ListenUnixArgs) -> Result<()> {
         tracing::trace!("connected to backend socket");
         let (read, write) = connection.into_split();
         tracing::trace!("starting forward_bidi");
-        forward_bidi(read, write, r, s).await?;
+        Connection::new(read, write, r, s, idle).forward().await?;
         tracing::trace!("forward_bidi finished");
         Ok(())
     }
 
     loop {
+        let shutdown = shutdown_token();
         let incoming = select! {
             incoming = endpoint.accept() => incoming,
-            _ = tokio::signal::ctrl_c() => {
+            _ = shutdown.cancelled() => {
                 eprintln!("got ctrl-c, exiting");
                 break;
             }
@@ -1177,8 +1394,10 @@ async fn listen_unix(args: ListenUnixArgs) -> Result<()> {
         };
         let socket_path = socket_path.clone();
         let handshake = !args.common.is_custom_alpn();
+        let idle = args.common.idle_timeout();
         tokio::spawn(async move {
-            if let Err(cause) = handle_endpoint_accept(incoming, socket_path, handshake).await {
+            if let Err(cause) = handle_endpoint_accept(incoming, socket_path, handshake, idle).await
+            {
                 // log error at warn level
                 //
                 // we should know about it, but it's not fatal
@@ -1245,8 +1464,9 @@ async fn connect_unix(args: ConnectUnixArgs) -> Result<()> {
 
     async fn handle_unix_accept(
         next: io::Result<(UnixStream, tokio::net::unix::SocketAddr)>,
-        connection: Connection,
+        connection: IrohConnection,
         handshake: bool,
+        idle: Option<Duration>,
     ) -> Result<()> {
         tracing::trace!("handling new local connection");
         let (unix_stream, unix_addr) = next.context("error accepting unix connection")?;
@@ -1274,7 +1494,9 @@ async fn connect_unix(args: ConnectUnixArgs) -> Result<()> {
         }
 
         tracing::trace!("starting forward_bidi");
-        forward_bidi(unix_recv, unix_send, endpoint_recv, endpoint_send).await?;
+        Connection::new(unix_recv, unix_send, endpoint_recv, endpoint_send, idle)
+            .forward()
+            .await?;
         tracing::trace!("forward_bidi finished");
         Ok(())
     }
@@ -1282,9 +1504,10 @@ async fn connect_unix(args: ConnectUnixArgs) -> Result<()> {
     tracing::info!("entering accept loop");
     loop {
         // also wait for ctrl-c here so we can use it before accepting a connection
+        let shutdown = shutdown_token();
         let next = tokio::select! {
             stream = unix_listener.accept() => stream,
-            _ = tokio::signal::ctrl_c() => {
+            _ = shutdown.cancelled() => {
                 eprintln!("got ctrl-c, exiting");
                 break;
             }
@@ -1292,9 +1515,10 @@ async fn connect_unix(args: ConnectUnixArgs) -> Result<()> {
         tracing::trace!("accepted a local connection");
         let connection = connection.clone();
         let handshake = !args.common.is_custom_alpn();
+        let idle = args.common.idle_timeout();
         tokio::spawn(async move {
             tracing::trace!("spawning handler task");
-            if let Err(cause) = handle_unix_accept(next, connection, handshake).await {
+            if let Err(cause) = handle_unix_accept(next, connection, handshake, idle).await {
                 // log error at warn level
                 //
                 // we should know about it, but it's not fatal
@@ -1438,9 +1662,10 @@ dumbpipe connect-udp --addr 0.0.0.0:0 {short}"
     }
 
     loop {
+        let shutdown = shutdown_token();
         let incoming = select! {
             incoming = endpoint.accept() => incoming,
-            _ = tokio::signal::ctrl_c() => {
+            _ = shutdown.cancelled() => {
                 eprintln!("got ctrl-c, exiting");
                 break;
             }
@@ -1501,5 +1726,71 @@ mod tests {
     fn test_parse_alpn() {
         assert_eq!(parse_alpn("utf8:foo").unwrap(), b"foo");
         assert_eq!(parse_alpn("666f6f").unwrap(), b"foo");
+    }
+
+    #[test]
+    fn idle_timeout_is_optional() {
+        let mut args = CommonArgs {
+            ipv4_addr: None,
+            ipv6_addr: None,
+            custom_alpn: None,
+            relay: None,
+            dns_servers: Vec::new(),
+            no_direct: false,
+            verbose: 0,
+            idle_timeout: 0,
+        };
+        assert_eq!(args.idle_timeout(), None);
+        args.idle_timeout = 7;
+        assert_eq!(args.idle_timeout(), Some(Duration::from_secs(7)));
+    }
+
+    #[tokio::test]
+    async fn copy_watched_calls_the_hook() {
+        use std::sync::atomic::AtomicUsize;
+
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let producer = tokio::spawn(async move {
+            writer.write_all(b"hello").await.unwrap();
+        });
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        let hook = move || {
+            counter.fetch_add(1, Ordering::Relaxed);
+        };
+        let mut sink = tokio::io::sink();
+        let copied = copy_watched(&mut reader, &mut sink, &hook).await.unwrap();
+        producer.await.unwrap();
+        assert_eq!(copied, 5);
+        assert_eq!(hits.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn watch_idle_cancels_silent_connection() {
+        let watch = Arc::new(IdleWatch::new());
+        let token = CancellationToken::new();
+        let watchdog = tokio::spawn(watch_idle(watch, Duration::from_millis(100), token.clone()));
+        tokio::time::timeout(Duration::from_secs(2), token.cancelled())
+            .await
+            .expect("idle connection was not cancelled");
+        watchdog.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn watch_idle_keeps_active_connection() {
+        let watch = Arc::new(IdleWatch::new());
+        let token = CancellationToken::new();
+        let watchdog = tokio::spawn(watch_idle(
+            watch.clone(),
+            Duration::from_millis(100),
+            token.clone(),
+        ));
+        for _ in 0..15 {
+            watch.touch();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(!token.is_cancelled(), "active connection was cancelled");
+        }
+        token.cancel();
+        watchdog.await.unwrap();
     }
 }

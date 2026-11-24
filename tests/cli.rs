@@ -835,3 +835,118 @@ fn logs_go_to_stderr() {
         "expected tracing output on stderr"
     );
 }
+
+struct TcpTunnel {
+    host_port: String,
+    listen: duct::ReaderHandle,
+    connect: duct::ReaderHandle,
+}
+
+impl Drop for TcpTunnel {
+    fn drop(&mut self) {
+        let _ = self.listen.kill();
+        let _ = self.connect.kill();
+    }
+}
+
+fn start_tcp_tunnel(idle_secs: u64) -> TcpTunnel {
+    let backend = format!("localhost:{}", random_port());
+    let backend_addr = backend.clone();
+    std::thread::spawn(move || {
+        let Ok(server) = TcpListener::bind(&backend_addr) else {
+            return;
+        };
+        for stream in server.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 1024];
+                while matches!(stream.read(&mut buf), Ok(n) if n > 0) {}
+            });
+        }
+    });
+    let idle = idle_secs.to_string();
+    let mut listen = duct::cmd(
+        dumbpipe_bin(),
+        [
+            "listen-tcp",
+            "--relay",
+            RELAYS[2],
+            "--host",
+            &backend,
+            "--idle-timeout",
+            &idle,
+        ],
+    )
+    .env_remove("RUST_LOG") // disable tracing
+    .stderr_to_stdout()
+    .reader()
+    .unwrap();
+    let header = read_ascii_lines(4, &mut listen).unwrap();
+    let header = String::from_utf8(header).unwrap();
+    let ticket = header.split_ascii_whitespace().last().unwrap();
+    let host_port = format!("localhost:{}", random_port());
+    let connect = duct::cmd(
+        dumbpipe_bin(),
+        [
+            "connect-tcp",
+            "--relay",
+            RELAYS[2],
+            "--addr",
+            &host_port,
+            "--idle-timeout",
+            &idle,
+            ticket,
+        ],
+    )
+    .env_remove("RUST_LOG") // disable tracing
+    .stderr_to_stdout()
+    .reader()
+    .unwrap();
+    std::thread::sleep(Duration::from_secs(2));
+    TcpTunnel {
+        host_port,
+        listen,
+        connect,
+    }
+}
+
+#[test]
+fn connect_tcp_idle_timeout_closes_connection() {
+    let tunnel = start_tcp_tunnel(2);
+    let mut conn = TcpStream::connect(&tunnel.host_port).unwrap();
+    conn.set_read_timeout(Some(Duration::from_secs(30)))
+        .unwrap();
+    let started = Instant::now();
+    let mut buf = [0u8; 64];
+    assert_eq!(
+        conn.read(&mut buf).unwrap_or(0),
+        0,
+        "idle connection was not closed"
+    );
+    assert!(started.elapsed() < Duration::from_secs(25));
+}
+
+#[test]
+fn connect_tcp_idle_timeout_keeps_active_connection() {
+    let tunnel = start_tcp_tunnel(3);
+    let mut conn = TcpStream::connect(&tunnel.host_port).unwrap();
+    conn.set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let mut buf = [0u8; 64];
+    for _ in 0..6 {
+        conn.write_all(b"ping").unwrap();
+        conn.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(700));
+    }
+    match conn.read(&mut buf) {
+        Ok(0) => panic!("active connection was closed by the idle timeout"),
+        Ok(_) => {}
+        Err(cause) => assert!(
+            matches!(
+                cause.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            "unexpected read error: {cause}"
+        ),
+    }
+}
